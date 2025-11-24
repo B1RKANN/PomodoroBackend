@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pomodoro Socket Test (Auth)</title>
+    <script src="https://cdn.socket.io/4.7.4/socket.io.min.js"></script>
+    <style>
+        body {
+            font-family: sans-serif;
+            padding: 20px;
+        }
+
+        .container {
+            display: flex;
+            gap: 20px;
+        }
+
+        .panel {
+            border: 1px solid #ccc;
+            padding: 10px;
+            width: 300px;
+        }
+
+        .log {
+            height: 200px;
+            overflow-y: auto;
+            background: #f0f0f0;
+            border: 1px solid #999;
+            margin-top: 10px;
+            padding: 5px;
+            font-size: 12px;
+        }
+
+        button {
+            margin: 5px 0;
+            cursor: pointer;
+        }
+
+        input,
+        select {
+            margin: 5px 0;
+            width: 100%;
+            box-sizing: border-box;
+        }
+
+        .hidden {
+            display: none;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Pomodoro Socket Test (Auth)</h1>
+
+    <div id="authPanel" class="panel">
+        <h3>Login / Register</h3>
+        <input type="text" id="email" placeholder="Email">
+        <input type="text" id="nickname" placeholder="Nickname">
+        <input type="password" id="password" placeholder="Password">
+        <button onclick="register()">Register</button>
+        <button onclick="login()">Login</button>
+    </div>
+
+    <div id="mainPanel" class="container hidden">
+        <div class="panel">
+            <h3>Create Room</h3>
+            <input type="text" id="createName" placeholder="Room Name">
+            <select id="createType">
+                <option value="SHARED_POMODORO">SHARED_POMODORO</option>
+                <option value="INDIVIDUAL_POMODORO">INDIVIDUAL_POMODORO</option>
+            </select>
+            <input type="password" id="createPassword" placeholder="Password (Optional)">
+            <button onclick="createRoom()">Create</button>
+        </div>
+
+        <div class="panel">
+            <h3>Join Room</h3>
+            <input type="text" id="joinName" placeholder="Room Name">
+            <input type="password" id="joinPassword" placeholder="Password (Optional)">
+            <button onclick="joinRoom()">Join</button>
+            <button onclick="getRoomDetails()">Get Room Details</button>
+            <button onclick="listRooms()">List Rooms</button>
+            <button onclick="leaveRoom()" style="background-color: #ffcccc;">Leave Room</button>
+        </div>
+
+        <div class="panel">
+            <h3>Controls (Shared)</h3>
+            <input type="number" id="timerMinutes" placeholder="Minutes" value="25">
+            <button onclick="setTimer()">Set Timer</button>
+            <button onclick="startTimer()">Start</button>
+            <button onclick="pauseTimer()">Pause</button>
+            <button onclick="stopTimer()">Stop</button>
+            <hr>
+            <h3>Status (Individual)</h3>
+            <button onclick="updateStatus()">Send Status Update</button>
+        </div>
+    </div>
+
+    <div class="panel" style="width: 100%; margin-top: 20px;">
+        <h3>Current Room: <span id="currentRoom">None</span></h3>
+        <h4>Participants: <span id="participantsList"></span></h4>
+        <h2>Timer: <span id="timerDisplay">00:00</span></h2>
+        <div id="log" class="log"></div>
+    </div>
+
+    <script>
+        let socket = null;
+        let currentRoomName = null;
+        let token = null;
+        const API_URL = 'http://localhost:3000/api/auth';
+
+        function log(message) {
+            const logDiv = document.getElementById('log');
+            logDiv.innerHTML += `<div>${new Date().toLocaleTimeString()} - ${message}</div>`;
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        async function register() {
+            const email = document.getElementById('email').value;
+            const nickname = document.getElementById('nickname').value;
+            const password = document.getElementById('password').value;
+
+            try {
+                const res = await fetch(`${API_URL}/register`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email, nickname, password })
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    log('Registered successfully. Please login.');
+                } else {
+                    log('Register Error: ' + data.message);
+                }
+            } catch (e) { log('Error: ' + e.message); }
+        }
+
+        async function login() {
+            const identifier = document.getElementById('email').value || document.getElementById('nickname').value;
+            const password = document.getElementById('password').value;
+
+            try {
+                const res = await fetch(`${API_URL}/login`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ identifier, password })
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    token = data.accessToken;
+                    log('Logged in! Token: ' + token.substring(0, 10) + '...');
+                    document.getElementById('authPanel').classList.add('hidden');
+                    document.getElementById('mainPanel').classList.remove('hidden');
+                    connectSocket();
+                } else {
+                    log('Login Error: ' + data.message);
+                }
+            } catch (e) { log('Error: ' + e.message); }
+        }
+
+        function connectSocket() {
+            socket = io('http://localhost:3000', {
+                auth: { token }
+            });
+
+            socket.on('connect', () => {
+                log('Connected to server: ' + socket.id);
+            });
+
+            socket.on('connect_error', (err) => {
+                log('Connection Error: ' + err.message);
+            });
+
+            socket.on('error', (data) => {
+                log('ERROR: ' + data.message);
+                alert('Error: ' + data.message);
+            });
+
+            socket.on('room_created', (room) => {
+                log('Room created: ' + room.name);
+                currentRoomName = room.name;
+                updateRoomUI(room);
+            });
+
+            socket.on('room_joined', (room) => {
+                log('Joined room: ' + room.name);
+                currentRoomName = room.name;
+                updateRoomUI(room);
+            });
+
+            socket.on('room_details', (room) => {
+                log('Room Details: ' + room.name);
+                updateRoomUI(room);
+                alert('Participants: ' + room.participants.map(p => p.nickname).join(', '));
+            });
+
+            socket.on('room_closed', (data) => {
+                log('Room Closed: ' + data.message);
+                currentRoomName = null;
+                document.getElementById('currentRoom').innerText = 'None';
+                document.getElementById('participantsList').innerText = '';
+                alert(data.message);
+            });
+
+            socket.on('participant_joined', (data) => {
+                log('Participant joined: ' + data.nickname);
+                updateParticipantsUI(data.participants);
+            });
+
+            socket.on('participant_left', (data) => {
+                log('Participant left: ' + data.userId);
+                updateParticipantsUI(data.participants);
+            });
+
+            socket.on('rooms_list', (rooms) => {
+                log('Rooms: ' + JSON.stringify(rooms.map(r => r.name)));
+            });
+
+            socket.on('timer_update', (data) => {
+                log('Timer update: ' + formatTime(data.remainingSeconds) + ' (Running: ' + data.isRunning + ')');
+                document.getElementById('timerDisplay').innerText = formatTime(data.remainingSeconds);
+            });
+
+            socket.on('timer_tick', (data) => {
+                document.getElementById('timerDisplay').innerText = formatTime(data.remainingSeconds);
+            });
+
+            socket.on('timer_started', () => log('Timer started'));
+            socket.on('timer_paused', () => log('Timer paused'));
+            socket.on('timer_stopped', () => {
+                log('Timer stopped');
+                document.getElementById('timerDisplay').innerText = '00:00';
+            });
+            socket.on('timer_finished', () => {
+                log('Timer finished!');
+                alert('Timer Finished!');
+            });
+
+            socket.on('user_status_update', (data) => {
+                log('User Status Update: ' + data.userId + ' -> ' + JSON.stringify(data.status));
+            });
+        }
+
+        function updateRoomUI(room) {
+            document.getElementById('currentRoom').innerText = room.name + ' (' + room.type + ')';
+            updateParticipantsUI(room.participants);
+        }
+
+        function updateParticipantsUI(participants) {
+            if (!participants) return;
+            const list = participants.map(p => p.nickname).join(', ');
+            document.getElementById('participantsList').innerText = list;
+        }
+
+        function createRoom() {
+            const name = document.getElementById('createName').value;
+            const type = document.getElementById('createType').value;
+            const password = document.getElementById('createPassword').value;
+            socket.emit('create_room', { name, type, password });
+        }
+
+        function joinRoom() {
+            const name = document.getElementById('joinName').value;
+            const password = document.getElementById('joinPassword').value;
+            socket.emit('join_room', { name, password });
+        }
+
+        function getRoomDetails() {
+            const name = document.getElementById('joinName').value || currentRoomName;
+            if (!name) return alert('Enter room name or join a room');
+            socket.emit('get_room', { roomName: name });
+        }
+
+        function leaveRoom() {
+            if (!currentRoomName) return;
+            socket.emit('leave_room', { roomName: currentRoomName });
+            currentRoomName = null;
+            document.getElementById('currentRoom').innerText = 'None';
+            document.getElementById('participantsList').innerText = '';
+        }
+
+        function listRooms() {
+            socket.emit('list_rooms');
+        }
+
+        function setTimer() {
+            if (!currentRoomName) return alert('Join a room first');
+            const minutes = parseInt(document.getElementById('timerMinutes').value);
+            socket.emit('set_timer', { roomName: currentRoomName, minutes });
+        }
+
+        function startTimer() {
+            if (!currentRoomName) return alert('Join a room first');
+            socket.emit('start_timer', { roomName: currentRoomName });
+        }
+
+        function pauseTimer() {
+            if (!currentRoomName) return alert('Join a room first');
+            socket.emit('pause_timer', { roomName: currentRoomName });
+        }
+
+        function stopTimer() {
+            if (!currentRoomName) return alert('Join a room first');
+            socket.emit('stop_timer', { roomName: currentRoomName });
+        }
+
+        function updateStatus() {
+            if (!currentRoomName) return alert('Join a room first');
+            socket.emit('update_status', { roomName: currentRoomName, status: { state: 'FOCUS', time: Date.now() } });
+        }
+
+        function formatTime(seconds) {
+            const m = Math.floor(seconds / 60);
+            const s = seconds % 60;
+            return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+        }
+    </script>
+</body>
+
+</html>
