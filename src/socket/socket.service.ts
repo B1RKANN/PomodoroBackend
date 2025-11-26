@@ -2,6 +2,7 @@ import { Server, Socket } from 'socket.io';
 import Room, { RoomType } from '../models/room.model';
 import { authMiddleware, AuthenticatedSocket } from './middleware/auth.middleware';
 import User from '../models/user.model';
+import { v4 as uuidv4 } from 'uuid';
 
 interface TimerState {
     intervalId?: NodeJS.Timeout;
@@ -11,6 +12,17 @@ interface TimerState {
 
 // In-memory storage for active timers
 const activeTimers: Map<string, TimerState> = new Map();
+
+interface ChatMessage {
+    id: string;
+    roomName: string;
+    userId: string;
+    nickname: string;
+    content: string;
+    timestamp: number;
+}
+
+const roomMessages: Map<string, ChatMessage[]> = new Map();
 
 export const initializeSocket = (io: Server) => {
     // Apply Auth Middleware
@@ -131,6 +143,64 @@ export const initializeSocket = (io: Server) => {
             await handleLeaveRoom(authSocket, data.roomName, io);
         });
 
+        authSocket.on('send_message', async (data: { roomName: string; content: string }, ack?: (response: any) => void) => {
+            try {
+                const room = await Room.findOne({ name: data.roomName });
+                if (!room) {
+                    if (ack) ack({ success: false, error: 'Room not found' });
+                    return;
+                }
+                const isParticipant = room.participants.some(p => p.userId === authSocket.data.userId);
+                if (!isParticipant) {
+                    if (ack) ack({ success: false, error: 'Not a participant' });
+                    return;
+                }
+                const content = (data.content || '').trim();
+                if (!content) {
+                    if (ack) ack({ success: false, error: 'Empty content' });
+                    return;
+                }
+                const message: ChatMessage = {
+                    id: uuidv4(),
+                    roomName: data.roomName,
+                    userId: authSocket.data.userId,
+                    nickname: userNickname,
+                    content,
+                    timestamp: Date.now()
+                };
+                const list = roomMessages.get(data.roomName) || [];
+                list.push(message);
+                if (list.length > 1000) list.shift();
+                roomMessages.set(data.roomName, list);
+                io.to(data.roomName).emit('message_received', message);
+                if (ack) ack({ success: true, id: message.id });
+            } catch (error) {
+                if (ack) ack({ success: false, error: String(error) });
+            }
+        });
+
+        authSocket.on('fetch_messages', async (data: { roomName: string; limit?: number }, ack?: (response: any) => void) => {
+            try {
+                const room = await Room.findOne({ name: data.roomName });
+                if (!room) {
+                    if (ack) ack({ success: false, error: 'Room not found' });
+                    return;
+                }
+                const isParticipant = room.participants.some(p => p.userId === authSocket.data.userId);
+                if (!isParticipant) {
+                    if (ack) ack({ success: false, error: 'Not a participant' });
+                    return;
+                }
+                const all = roomMessages.get(data.roomName) || [];
+                const limit = Math.max(1, Math.min(data.limit || 50, 200));
+                const slice = all.slice(Math.max(0, all.length - limit));
+                authSocket.emit('messages_history', slice);
+                if (ack) ack({ success: true, count: slice.length });
+            } catch (error) {
+                if (ack) ack({ success: false, error: String(error) });
+            }
+        });
+
         authSocket.on('get_room', async (data: { roomName: string }) => {
             try {
                 const room = await Room.findOne({ name: data.roomName });
@@ -158,28 +228,29 @@ export const initializeSocket = (io: Server) => {
         authSocket.on('set_timer', async (data: { roomName: string; minutes: number }) => {
             try {
                 const room = await Room.findOne({ name: data.roomName });
-                // Allow any participant to set timer in Shared Mode? 
-                // Requirement: "Shared Control: In SHARED_POMODORO mode, ensure all participants can access start, pause, and stop functions."
-                // Assuming Set Timer is also shared.
                 if (!room || room.type !== RoomType.SHARED_POMODORO) return;
 
-                // Check if user is participant
                 if (!room.participants.some(p => p.userId === authSocket.data.userId)) return;
 
+                const roomId = room._id.toString();
+                let timerState = activeTimers.get(roomId);
+                const newRemaining = data.minutes * 60;
+
+                if (!timerState) {
+                    timerState = { remainingSeconds: newRemaining, isRunning: false };
+                    activeTimers.set(roomId, timerState);
+                } else {
+                    timerState.remainingSeconds = newRemaining;
+                }
+
                 room.timer.minutes = data.minutes;
-                room.timer.remainingSeconds = data.minutes * 60;
-                room.timer.isRunning = false;
+                room.timer.remainingSeconds = newRemaining;
+                room.timer.isRunning = timerState.isRunning;
                 await room.save();
 
-                // Update in-memory state
-                activeTimers.set(room._id.toString(), {
-                    remainingSeconds: data.minutes * 60,
-                    isRunning: false
-                });
-
                 io.to(data.roomName).emit('timer_update', {
-                    remainingSeconds: room.timer.remainingSeconds,
-                    isRunning: false
+                    remainingSeconds: timerState.remainingSeconds,
+                    isRunning: timerState.isRunning
                 });
 
             } catch (error) {
@@ -187,38 +258,80 @@ export const initializeSocket = (io: Server) => {
             }
         });
 
-        authSocket.on('start_timer', async (data: { roomName: string }) => {
+        authSocket.on('start_timer', async (data: { roomName: string }, ack?: (response: any) => void) => {
             try {
+                console.log('[socket] start_timer received:', data);
                 const room = await Room.findOne({ name: data.roomName });
-                if (!room || room.type !== RoomType.SHARED_POMODORO) return;
-                if (!room.participants.some(p => p.userId === authSocket.data.userId)) return;
+                if (!room || room.type !== RoomType.SHARED_POMODORO) {
+                    console.log('[socket] start_timer failed: invalid room');
+                    if (ack) ack({ success: false, error: 'Invalid room' });
+                    return;
+                }
+                if (!room.participants.some(p => p.userId === authSocket.data.userId)) {
+                    console.log('[socket] start_timer failed: not a participant');
+                    if (ack) ack({ success: false, error: 'Not a participant' });
+                    return;
+                }
 
-                let timerState = activeTimers.get(room._id.toString());
+                const roomId = room._id.toString();
+                let timerState = activeTimers.get(roomId);
                 if (!timerState) {
                     timerState = {
                         remainingSeconds: room.timer.remainingSeconds,
                         isRunning: false
                     };
+                    activeTimers.set(roomId, timerState);
+                    console.log('[socket] new timer state created');
                 }
 
-                if (timerState.isRunning) return;
+                if (timerState.isRunning) {
+                    console.log('[socket] timer already running');
+                    if (ack) ack({ success: false, error: 'Timer already running' });
+                    return;
+                }
+
+                // Clear any existing interval
+                if (timerState.intervalId) {
+                    console.log('[socket] clearing existing interval before start');
+                    clearInterval(timerState.intervalId);
+                    timerState.intervalId = undefined;
+                }
 
                 timerState.isRunning = true;
-                activeTimers.set(room._id.toString(), timerState);
+                activeTimers.set(roomId, timerState);
+                console.log('[socket] timer starting, remainingSeconds:', timerState.remainingSeconds, 'isRunning:', timerState.isRunning);
 
                 io.to(data.roomName).emit('timer_started');
+                if (ack) ack({ success: true });
 
-                if (timerState.intervalId) clearInterval(timerState.intervalId);
+                await Room.findByIdAndUpdate(room._id, {
+                    'timer.isRunning': true
+                });
 
                 timerState.intervalId = setInterval(async () => {
-                    if (timerState && timerState.remainingSeconds > 0) {
-                        timerState.remainingSeconds--;
-                        io.to(data.roomName).emit('timer_tick', { remainingSeconds: timerState.remainingSeconds });
-                    } else if (timerState) {
-                        timerState.isRunning = false;
-                        clearInterval(timerState.intervalId!);
+                    const currentState = activeTimers.get(roomId);
+
+                    if (!currentState || !currentState.isRunning) {
+                        if (timerState.intervalId) {
+                            clearInterval(timerState.intervalId);
+                            timerState.intervalId = undefined;
+                        }
+                        console.log('[socket] interval tick stopped - timer not running');
+                        return;
+                    }
+
+                    if (currentState.remainingSeconds > 0) {
+                        currentState.remainingSeconds--;
+                        io.to(data.roomName).emit('timer_tick', { remainingSeconds: currentState.remainingSeconds });
+                    } else {
+                        currentState.isRunning = false;
+                        if (currentState.intervalId) {
+                            clearInterval(currentState.intervalId);
+                            currentState.intervalId = undefined;
+                        }
                         io.to(data.roomName).emit('timer_finished');
-                        activeTimers.delete(room._id.toString());
+                        activeTimers.delete(roomId);
+                        console.log('[socket] timer finished');
 
                         await Room.findByIdAndUpdate(room._id, {
                             'timer.isRunning': false,
@@ -227,25 +340,58 @@ export const initializeSocket = (io: Server) => {
                     }
                 }, 1000);
 
+                console.log('[socket] interval started, intervalId:', timerState.intervalId);
+
             } catch (error) {
-                console.error(error);
+                console.error('[socket] start_timer error:', error);
+                if (ack) ack({ success: false, error: String(error) });
             }
         });
 
-        authSocket.on('pause_timer', async (data: { roomName: string }) => {
+        authSocket.on('pause_timer', async (data: { roomName: string }, ack?: (response: any) => void) => {
             try {
+                console.log('[socket] pause_timer received:', data);
                 const room = await Room.findOne({ name: data.roomName });
-                if (!room || room.type !== RoomType.SHARED_POMODORO) return;
-                if (!room.participants.some(p => p.userId === authSocket.data.userId)) return;
+
+                if (!room || room.type !== RoomType.SHARED_POMODORO) {
+                    console.log('[socket] pause_timer failed: room not found or wrong type');
+                    if (ack) ack({ success: false, error: 'Invalid room' });
+                    return;
+                }
+
+                if (!room.participants.some(p => p.userId === authSocket.data.userId)) {
+                    console.log('[socket] pause_timer failed: user not participant');
+                    if (ack) ack({ success: false, error: 'Not a participant' });
+                    return;
+                }
 
                 const timerState = activeTimers.get(room._id.toString());
-                if (timerState && timerState.isRunning) {
-                    timerState.isRunning = false;
-                    if (timerState.intervalId) clearInterval(timerState.intervalId);
+                console.log('[socket] timerState:', timerState);
+
+                if (timerState) {  // ← SADECE timerState kontrolü, isRunning kontrolü yok
+                    if (timerState.intervalId) {
+                        clearInterval(timerState.intervalId);
+                        timerState.intervalId = undefined;
+                        console.log('[socket] interval cleared');
+                    }
+                    timerState.isRunning = false;  // ← Her durumda false yap
+                    // KRİTİK: State değişikliğini Map'e kaydetmeliyiz!
+                    activeTimers.set(room._id.toString(), timerState);
                     io.to(data.roomName).emit('timer_paused');
+                    if (ack) ack({ success: true });
+                    console.log('[socket] timer paused successfully');
+
+                    await Room.findByIdAndUpdate(room._id, {
+                        'timer.isRunning': false,
+                        'timer.remainingSeconds': timerState.remainingSeconds
+                    });
+                } else {
+                    console.log('[socket] timer not found');
+                    if (ack) ack({ success: false, error: 'Timer not found' });
                 }
             } catch (error) {
-                console.error(error);
+                console.error('[socket] pause_timer error:', error);
+                if (ack) ack({ success: false, error: String(error) });
             }
         });
 
@@ -313,6 +459,7 @@ async function handleLeaveRoom(socket: AuthenticatedSocket, roomName: string, io
             room.participants = room.participants.filter(p => p.userId !== userId);
             await room.save();
             socket.leave(roomName);
+            socket.emit('room_left', { roomName, userId, participants: room.participants });
             io.to(roomName).emit('participant_left', { userId, participants: room.participants });
             console.log(`User ${userId} left room ${roomName}`);
         }

@@ -96,6 +96,16 @@
             <h3>Status (Individual)</h3>
             <button onclick="updateStatus()">Send Status Update</button>
         </div>
+
+        <div class="panel" style="width: 100%;">
+            <h3>Chat</h3>
+            <div style="display:flex; gap:8px;">
+                <input type="text" id="chatInput" placeholder="Message" style="flex:1;">
+                <button onclick="sendMessage()">Send</button>
+            </div>
+            <button onclick="fetchMessages()" style="margin-top:8px;">Fetch Last 50</button>
+            <div id="chatLog" class="log" style="height:240px;"></div>
+        </div>
     </div>
 
     <div class="panel" style="width: 100%; margin-top: 20px;">
@@ -109,7 +119,7 @@
         let socket = null;
         let currentRoomName = null;
         let token = null;
-        const API_URL = 'http://localhost:3000/api/auth';
+        const API_URL = 'http://localhost:5000/api/auth';
 
         function log(message) {
             const logDiv = document.getElementById('log');
@@ -161,8 +171,12 @@
         }
 
         function connectSocket() {
-            socket = io('http://localhost:3000', {
-                auth: { token }
+            socket = io('http://localhost:5000', {
+                auth: { token },
+                reconnection: true,
+                reconnectionAttempts: 10,
+                reconnectionDelay: 500,
+                reconnectionDelayMax: 5000
             });
 
             socket.on('connect', () => {
@@ -182,12 +196,14 @@
                 log('Room created: ' + room.name);
                 currentRoomName = room.name;
                 updateRoomUI(room);
+                fetchMessages();
             });
 
             socket.on('room_joined', (room) => {
                 log('Joined room: ' + room.name);
                 currentRoomName = room.name;
                 updateRoomUI(room);
+                fetchMessages();
             });
 
             socket.on('room_details', (room) => {
@@ -240,6 +256,17 @@
 
             socket.on('user_status_update', (data) => {
                 log('User Status Update: ' + data.userId + ' -> ' + JSON.stringify(data.status));
+            });
+
+            socket.on('message_received', (msg) => {
+                log('[IN] message ' + msg.id + ' from ' + msg.nickname + ' (' + msg.userId + '): ' + msg.content);
+                appendChat(msg);
+            });
+
+            socket.on('messages_history', (messages) => {
+                log('Messages history: ' + messages.length);
+                document.getElementById('chatLog').innerHTML = '';
+                for (const m of messages) appendChat(m);
             });
         }
 
@@ -309,6 +336,44 @@
         function updateStatus() {
             if (!currentRoomName) return alert('Join a room first');
             socket.emit('update_status', { roomName: currentRoomName, status: { state: 'FOCUS', time: Date.now() } });
+        }
+
+        function sendMessage() {
+            if (!currentRoomName) return alert('Join a room first');
+            const content = document.getElementById('chatInput').value;
+            const payload = { roomName: currentRoomName, content };
+            log('[OUT] send_message ' + JSON.stringify(payload));
+            socket.emit('send_message', payload, (ack) => {
+                if (ack && ack.success) {
+                    log('[ACK] send_message success id=' + ack.id);
+                    document.getElementById('chatInput').value = '';
+                } else {
+                    log('[ACK] send_message error ' + (ack && ack.error));
+                }
+            });
+        }
+
+        function fetchMessages() {
+            if (!currentRoomName) return;
+            const payload = { roomName: currentRoomName, limit: 50 };
+            log('[OUT] fetch_messages ' + JSON.stringify(payload));
+            socket.emit('fetch_messages', payload, (ack) => {
+                if (ack && ack.success) {
+                    log('[ACK] fetch_messages count=' + ack.count);
+                } else {
+                    log('[ACK] fetch_messages error ' + (ack && ack.error));
+                }
+            });
+        }
+
+        function appendChat(msg) {
+            const div = document.getElementById('chatLog');
+            const time = new Date(msg.timestamp).toLocaleTimeString();
+            const line = `${time} ${msg.nickname}: ${msg.content}`;
+            const el = document.createElement('div');
+            el.textContent = line;
+            div.appendChild(el);
+            div.scrollTop = div.scrollHeight;
         }
 
         function formatTime(seconds) {
