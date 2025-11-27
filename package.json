@@ -28,6 +28,7 @@
     "@types/bcrypt": "^6.0.0",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.5",
+    "@types/jest": "^30.0.0",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/mongoose": "^5.11.96",
     "@types/node": "^24.10.1",
@@ -36,8 +37,11 @@
     "@types/swagger-jsdoc": "^6.0.4",
     "@types/swagger-ui-express": "^4.1.8",
     "@types/uuid": "^10.0.0",
+    "jest": "^30.2.0",
+    "mongodb-memory-server": "^10.3.0",
     "node-fetch": "^3.3.2",
     "nodemon": "^3.1.11",
+    "ts-jest": "^29.4.5",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   }
