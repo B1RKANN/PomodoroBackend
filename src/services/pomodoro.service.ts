@@ -2,17 +2,36 @@ import { PomodoroRepository } from '../repositories/pomodoro.repository';
 import { TaskRepository } from '../repositories/task.repository';
 import { IPomodoroSession } from '../models/pomodoroSession.model';
 
-function startOfDay(date: Date) { const d = new Date(date); d.setHours(0,0,0,0); return d; }
-function endOfDay(date: Date) { const d = new Date(date); d.setHours(23,59,59,999); return d; }
-function startOfWeek(date: Date) {
-    const d = new Date(date);
-    const day = d.getDay();
-    const diff = (day === 0 ? -6 : 1) - day; // make Monday start
-    d.setDate(d.getDate() + diff);
-    d.setHours(0,0,0,0);
-    return d;
+function fmtIstanbul(date: Date) {
+    const s = new Intl.DateTimeFormat('sv-SE', {
+        timeZone: 'Europe/Istanbul',
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        hourCycle: 'h24'
+    }).format(date);
+    const [ymd, hms] = s.split(' ');
+    return `${ymd}T${hms}+03:00`;
 }
-function endOfWeek(date: Date) { const s = startOfWeek(date); const e = new Date(s); e.setDate(e.getDate()+6); e.setHours(23,59,59,999); return e; }
+
+function istanbulYmd(date: Date) {
+    const s = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Istanbul', year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
+    return s;
+}
+
+function istanbulHour(date: Date) {
+    const s = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Istanbul', hour: '2-digit', hourCycle: 'h24' }).format(date);
+    return parseInt(s, 10);
+}
+
+function istanbulStartOfDay(date: Date) {
+    const ymd = istanbulYmd(date);
+    return new Date(`${ymd}T00:00:00+03:00`);
+}
+
+function istanbulEndOfDay(date: Date) {
+    const ymd = istanbulYmd(date);
+    return new Date(`${ymd}T23:59:59.999+03:00`);
+}
 
 export class PomodoroService {
     private repo: PomodoroRepository;
@@ -24,20 +43,19 @@ export class PomodoroService {
     }
 
     async recordSession(userId: string, input: { durationMinutes: number; taskId?: string; startTime?: Date; endTime?: Date }): Promise<IPomodoroSession> {
-        const end = input.endTime ? new Date(input.endTime) : new Date();
+        const now = new Date();
+        const end = input.endTime ? new Date(input.endTime) : now;
         const start = input.startTime ? new Date(input.startTime) : new Date(end.getTime() - input.durationMinutes * 60_000);
         return await this.repo.create({ userId, taskId: input.taskId, startTime: start, endTime: end, durationMinutes: input.durationMinutes });
     }
 
     async summary(userId: string, days = 14) {
         const now = new Date();
-        const todayStart = startOfDay(now);
-        const todayEnd = endOfDay(now);
-        const weekStart = startOfWeek(now);
-        const weekEnd = endOfWeek(now);
-        const rangeStart = new Date(now);
-        rangeStart.setDate(rangeStart.getDate() - (days - 1));
-        rangeStart.setHours(0,0,0,0);
+        const todayStart = istanbulStartOfDay(now);
+        const todayEnd = istanbulEndOfDay(now);
+        const weekStart = new Date(todayStart.getTime() - 6 * 24 * 60 * 60 * 1000);
+        const weekEnd = todayEnd;
+        const rangeStart = new Date(istanbulStartOfDay(new Date(now.getTime() - (days - 1) * 24 * 60 * 60 * 1000)));
         const rangeEnd = todayEnd;
 
         const totalFocus = await this.repo.sumDurationByUser(userId);
@@ -50,17 +68,17 @@ export class PomodoroService {
 
         const sessions = await this.repo.findByUserInRange(userId, rangeStart, rangeEnd);
         const heatmapCells = sessions.map(s => ({
-            date: s.startTime.toISOString().slice(0,10),
-            hour: s.startTime.getHours(),
+            date: istanbulYmd(s.startTime),
+            hour: istanbulHour(s.startTime),
             minutes: s.durationMinutes
         }));
 
         return {
             totals: { focusMinutes: totalFocus, completedTasks: totalCompleted },
-            week: { focusMinutes: weekFocus, completedTasks: weekCompleted, startDate: weekStart, endDate: weekEnd },
-            today: { focusMinutes: todayFocus, completedTasks: todayCompleted, date: todayStart },
-            heatmap: { startDate: rangeStart, endDate: rangeEnd, cells: heatmapCells }
+            week: { focusMinutes: weekFocus, completedTasks: weekCompleted, startDate: fmtIstanbul(weekStart), endDate: fmtIstanbul(weekEnd) },
+            today: { focusMinutes: todayFocus, completedTasks: todayCompleted, date: fmtIstanbul(todayStart) },
+            heatmap: { startDate: fmtIstanbul(rangeStart), endDate: fmtIstanbul(rangeEnd), cells: heatmapCells },
+            sessions: sessions.map(s => ({ startTime: fmtIstanbul(s.startTime), endTime: fmtIstanbul(s.endTime), durationMinutes: s.durationMinutes }))
         };
     }
 }
-

@@ -67,10 +67,10 @@ export class AuthService {
     }
 
     private generateAccessToken(userId: string): string {
-        return jwt.sign({ id: userId }, config.jwtSecret, { expiresIn: '15m' });
+        return jwt.sign({ id: userId }, config.jwtSecret, { expiresIn: '7d' });
     }
 
     private generateRefreshToken(userId: string): string {
-        return jwt.sign({ id: userId }, config.refreshTokenSecret, { expiresIn: '7d' });
+        return jwt.sign({ id: userId }, config.refreshTokenSecret, { expiresIn: '30d' });
     }
 }

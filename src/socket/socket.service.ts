@@ -23,6 +23,7 @@ interface ChatMessage {
 }
 
 const roomMessages: Map<string, ChatMessage[]> = new Map();
+const pendingHostClosures: Map<string, NodeJS.Timeout> = new Map();
 
 export const initializeSocket = (io: Server) => {
     // Apply Auth Middleware
@@ -121,6 +122,16 @@ export const initializeSocket = (io: Server) => {
                     participants: updatedRoom?.participants
                 });
 
+                if (updatedRoom && updatedRoom.hostUserId === authSocket.data.userId) {
+                    const rid = updatedRoom._id.toString();
+                    const t = pendingHostClosures.get(rid);
+                    if (t) {
+                        clearTimeout(t);
+                        pendingHostClosures.delete(rid);
+                        console.log('[room] pending auto-close canceled, host rejoined:', name);
+                    }
+                }
+
                 // Send current timer state if exists
                 if (room.type === RoomType.SHARED_POMODORO) {
                     const timerState = activeTimers.get(room._id.toString());
@@ -140,7 +151,8 @@ export const initializeSocket = (io: Server) => {
         });
 
         authSocket.on('leave_room', async (data: { roomName: string }) => {
-            await handleLeaveRoom(authSocket, data.roomName, io);
+            console.log('[socket] leave_room received from', authSocket.data.userId, 'room', data.roomName);
+            await handleLeaveRoom(authSocket, data.roomName, io, true, 'leave_event');
         });
 
         authSocket.on('send_message', async (data: { roomName: string; content: string }, ack?: (response: any) => void) => {
@@ -301,7 +313,9 @@ export const initializeSocket = (io: Server) => {
                 activeTimers.set(roomId, timerState);
                 console.log('[socket] timer starting, remainingSeconds:', timerState.remainingSeconds, 'isRunning:', timerState.isRunning);
 
-                io.to(data.roomName).emit('timer_started');
+                const fullDuration = room.timer.minutes * 60;
+                const action = (timerState.remainingSeconds < fullDuration && timerState.remainingSeconds > 0) ? 'resume' : 'start';
+                io.to(data.roomName).emit('timer_started', { nickname: userNickname, userId: authSocket.data.userId, action });
                 if (ack) ack({ success: true });
 
                 await Room.findByIdAndUpdate(room._id, {
@@ -377,7 +391,7 @@ export const initializeSocket = (io: Server) => {
                     timerState.isRunning = false;  // ← Her durumda false yap
                     // KRİTİK: State değişikliğini Map'e kaydetmeliyiz!
                     activeTimers.set(room._id.toString(), timerState);
-                    io.to(data.roomName).emit('timer_paused');
+                    io.to(data.roomName).emit('timer_paused', { nickname: userNickname, userId: authSocket.data.userId });
                     if (ack) ack({ success: true });
                     console.log('[socket] timer paused successfully');
 
@@ -407,7 +421,7 @@ export const initializeSocket = (io: Server) => {
                     activeTimers.delete(room._id.toString());
                 }
 
-                io.to(data.roomName).emit('timer_stopped');
+                io.to(data.roomName).emit('timer_stopped', { nickname: userNickname, userId: authSocket.data.userId });
 
                 await Room.findByIdAndUpdate(room._id, {
                     'timer.isRunning': false,
@@ -426,34 +440,63 @@ export const initializeSocket = (io: Server) => {
 
 
         authSocket.on('disconnect', async () => {
-            console.log(`User disconnected: ${authSocket.data.userId}`);
+            console.log('[socket] disconnect', authSocket.data.userId, authSocket.id);
             // Find rooms where user is participant
             const rooms = await Room.find({ "participants.userId": authSocket.data.userId });
             for (const room of rooms) {
-                await handleLeaveRoom(authSocket, room.name, io);
+                await handleLeaveRoom(authSocket, room.name, io, false, 'disconnect');
             }
         });
     });
 };
 
-async function handleLeaveRoom(socket: AuthenticatedSocket, roomName: string, io: Server) {
+async function handleLeaveRoom(socket: AuthenticatedSocket, roomName: string, io: Server, hostImmediate: boolean = false, origin: string = 'leave_event') {
     try {
         const room = await Room.findOne({ name: roomName });
         if (!room) return;
 
         const userId = socket.data.userId;
 
-        // If Host leaves -> Delete Room
         if (room.hostUserId === userId) {
-            // Stop timer if running
-            const timerState = activeTimers.get(room._id.toString());
+            const rid = room._id.toString();
+            const timerState = activeTimers.get(rid);
             if (timerState && timerState.intervalId) clearInterval(timerState.intervalId);
-            activeTimers.delete(room._id.toString());
+            activeTimers.delete(rid);
 
-            await Room.deleteOne({ _id: room._id });
-            io.to(roomName).emit('room_closed', { message: 'Host left the room.' });
-            io.in(roomName).socketsLeave(roomName); // Force everyone out
-            console.log(`Room ${roomName} deleted because host left.`);
+            const existing = pendingHostClosures.get(rid);
+            if (existing) {
+                clearTimeout(existing);
+                pendingHostClosures.delete(rid);
+            }
+
+            if (hostImmediate) {
+                await Room.deleteOne({ _id: rid });
+                roomMessages.delete(roomName);
+                io.to(roomName).emit('room_closed', { message: 'Host left the room (leave_room).' });
+                io.in(roomName).socketsLeave(roomName);
+                console.log('[room] immediate close by host leave_room, room', roomName, 'origin', origin);
+            } else {
+                room.participants = room.participants.filter(p => p.userId !== userId);
+                await room.save();
+                io.to(roomName).emit('participant_left', { userId, participants: room.participants });
+                console.log('[room] host removed from participants for timeout tracking, room', roomName);
+                const timeoutId = setTimeout(async () => {
+                    try {
+                        const latest = await Room.findById(rid);
+                        if (!latest) return;
+                        const hostBack = latest.participants.some(p => p.userId === latest.hostUserId);
+                        if (hostBack) return;
+                        await Room.deleteOne({ _id: rid });
+                        roomMessages.delete(roomName);
+                        io.to(roomName).emit('room_closed', { message: 'Host disconnect timeout reached (30s).' });
+                        io.in(roomName).socketsLeave(roomName);
+                        pendingHostClosures.delete(rid);
+                        console.log('[room] auto-close after timeout, room', roomName);
+                    } catch (e) {}
+                }, 30000);
+                pendingHostClosures.set(rid, timeoutId);
+                console.log('[room] host disconnected, scheduled auto-close in 30s, room', roomName, 'origin', origin);
+            }
         } else {
             // Participant leaves
             room.participants = room.participants.filter(p => p.userId !== userId);
@@ -461,7 +504,7 @@ async function handleLeaveRoom(socket: AuthenticatedSocket, roomName: string, io
             socket.leave(roomName);
             socket.emit('room_left', { roomName, userId, participants: room.participants });
             io.to(roomName).emit('participant_left', { userId, participants: room.participants });
-            console.log(`User ${userId} left room ${roomName}`);
+            console.log('[room] participant left', userId, 'room', roomName, 'origin', origin);
         }
     } catch (error) {
         console.error("Error handling leave room:", error);
