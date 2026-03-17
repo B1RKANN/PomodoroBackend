@@ -6,6 +6,7 @@ import authRoutes from './routes/auth.routes';
 import taskRoutes from './routes/task.routes';
 import pomodoroRoutes from './routes/pomodoro.routes';
 import roomRoutes from './routes/room.routes';
+import healthRoutes from './routes/health.routes';
 import swaggerUi from 'swagger-ui-express';
 import { swaggerSpec } from './config/swagger';
 
@@ -35,10 +36,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/tasks', taskRoutes);
 app.use('/api/pomodoro', pomodoroRoutes);
 app.use('/api/rooms', roomRoutes);
-
-app.get('/api/health', (req, res) => {
-    res.status(200).json({ status: 'OK' });
-});
+app.use('/api/health', healthRoutes);
 
 // Initialize Socket Service
 initializeSocket(io);
