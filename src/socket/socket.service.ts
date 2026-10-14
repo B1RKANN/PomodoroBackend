@@ -23,6 +23,17 @@ interface ChatMessage {
 }
 
 const roomMessages: Map<string, ChatMessage[]> = new Map();
+
+/**
+ * A session is "in progress" once it has started and not yet finished or been
+ * stopped — running, or paused somewhere between full duration and zero.
+ * While in progress the duration is locked.
+ */
+function isTimerInProgress(state: TimerState | undefined, totalSeconds: number): boolean {
+    if (!state) return false;
+    if (state.isRunning) return true;
+    return state.remainingSeconds > 0 && state.remainingSeconds < totalSeconds;
+}
 const pendingHostClosures: Map<string, NodeJS.Timeout> = new Map();
 
 export const initializeSocket = (io: Server) => {
@@ -237,16 +248,32 @@ export const initializeSocket = (io: Server) => {
 
         // --- TIMER MANAGEMENT (SHARED) ---
 
-        authSocket.on('set_timer', async (data: { roomName: string; minutes: number }) => {
+        authSocket.on('set_timer', async (data: { roomName: string; minutes: number }, ack?: (response: any) => void) => {
             try {
                 const room = await Room.findOne({ name: data.roomName });
                 if (!room || room.type !== RoomType.SHARED_POMODORO) return;
 
                 if (!room.participants.some(p => p.userId === authSocket.data.userId)) return;
 
+                const minutes = Math.max(1, Math.min(180, Math.round(Number(data.minutes) || 0)));
                 const roomId = room._id.toString();
                 let timerState = activeTimers.get(roomId);
-                const newRemaining = data.minutes * 60;
+
+                // Duration is locked while a session is running or paused —
+                // it can only change once the timer finishes or is stopped.
+                if (isTimerInProgress(timerState, room.timer.minutes * 60)) {
+                    // Resync the caller, who may have updated its UI optimistically.
+                    authSocket.emit('timer_update', {
+                        remainingSeconds: timerState!.remainingSeconds,
+                        isRunning: timerState!.isRunning,
+                        totalSeconds: room.timer.minutes * 60,
+                        minutes: room.timer.minutes
+                    });
+                    if (ack) ack({ success: false, error: 'Timer in progress' });
+                    return;
+                }
+
+                const newRemaining = minutes * 60;
 
                 if (!timerState) {
                     timerState = { remainingSeconds: newRemaining, isRunning: false };
@@ -255,15 +282,18 @@ export const initializeSocket = (io: Server) => {
                     timerState.remainingSeconds = newRemaining;
                 }
 
-                room.timer.minutes = data.minutes;
+                room.timer.minutes = minutes;
                 room.timer.remainingSeconds = newRemaining;
                 room.timer.isRunning = timerState.isRunning;
                 await room.save();
 
                 io.to(data.roomName).emit('timer_update', {
                     remainingSeconds: timerState.remainingSeconds,
-                    isRunning: timerState.isRunning
+                    isRunning: timerState.isRunning,
+                    totalSeconds: newRemaining,
+                    minutes
                 });
+                if (ack) ack({ success: true });
 
             } catch (error) {
                 console.error(error);
@@ -288,8 +318,10 @@ export const initializeSocket = (io: Server) => {
                 const roomId = room._id.toString();
                 let timerState = activeTimers.get(roomId);
                 if (!timerState) {
+                    const stored = room.timer.remainingSeconds;
                     timerState = {
-                        remainingSeconds: room.timer.remainingSeconds,
+                        // 0 means the last session finished/was stopped: start fresh.
+                        remainingSeconds: stored > 0 ? stored : room.timer.minutes * 60,
                         isRunning: false
                     };
                     activeTimers.set(roomId, timerState);
@@ -421,11 +453,18 @@ export const initializeSocket = (io: Server) => {
                     activeTimers.delete(room._id.toString());
                 }
 
-                io.to(data.roomName).emit('timer_stopped', { nickname: userNickname, userId: authSocket.data.userId });
+                const fullSeconds = room.timer.minutes * 60;
+                io.to(data.roomName).emit('timer_stopped', {
+                    nickname: userNickname,
+                    userId: authSocket.data.userId,
+                    totalSeconds: fullSeconds,
+                    minutes: room.timer.minutes
+                });
 
+                // Back to a fresh, unlocked session at the current duration.
                 await Room.findByIdAndUpdate(room._id, {
                     'timer.isRunning': false,
-                    'timer.remainingSeconds': 0
+                    'timer.remainingSeconds': fullSeconds
                 });
 
             } catch (error) {
